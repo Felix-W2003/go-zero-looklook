@@ -13,6 +13,7 @@ import (
 
 type OrderServer struct {
 	svcCtx *svc.ServiceContext
+	pb.UnimplementedOrderServer
 }
 
 func NewOrderServer(svcCtx *svc.ServiceContext) *OrderServer {

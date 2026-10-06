@@ -67,11 +67,45 @@ goctl rpc protoc order.proto --go_out=../ --go-grpc_out=../ --zrpc_out=../ --sty
 重新生成后重启 order-rpc，确认订单详情接口返回 `needFood=1`，与数据库值一致。
 
 ```
-（此处待补充验证命令与输出）
+$env:MYSQL_PWD = 'PXDN93VRKUm8TeE7'
+& 'C:\Program Files\MySQL\MySQL Server 9.2\bin\mysql.exe' -h 127.0.0.1 -P 33069 -u root -t -e `
+  "SELECT sn, user_id, need_food, trade_state FROM looklook_order.homestay_order WHERE need_food = 1;"
+
+
+$gw = 'http://127.0.0.1:8888'
+
+# 2-1) 登录（用户 3 = 13777778888，上面那个订单的归属人）
+$login = Invoke-RestMethod -Uri "$gw/usercenter/v1/user/login" -Method Post `
+    -ContentType 'application/json' `
+    -Body '{"mobile":"13777778888","password":"abc123"}'
+$tok = $login.data.accessToken
+Write-Host "token 长度: $($tok.Length)"
+
+# 2-2) 查订单详情，重点看 needFood
+try {
+    $r = Invoke-RestMethod -Uri "$gw/order/v1/homestayOrder/userHomestayOrderDetail" -Method Post `
+        -ContentType 'application/json' `
+        -Headers @{ Authorization = "Bearer $tok" } `
+        -Body '{"sn":"HSO2026100217125693042474"}'
+    Write-Host "needFood        = $($r.data.needFood)    <- 期望 1（修复前是 0）"
+    Write-Host "orderTotalPrice = $($r.data.orderTotalPrice)"
+    Write-Host "tradeState      = $($r.data.tradeState)"
+} catch {
+    Write-Host "请求失败: $($_.ErrorDetails.Message)"
+}
 ```
 
 ### commit
 
 ```
-（此处待补充）
++---------------------------+---------+-----------+-------------+
+| sn                        | user_id | need_food | trade_state |
++---------------------------+---------+-----------+-------------+
+| HSO2026100217125693042474 |       3 |         1 |          -1 |
+| HSO2026100419080564475151 |       1 |         1 |          -1 |
++---------------------------+---------+-----------+-------------+
+
+needFood        = 1    <- 期望 1（修复前是 0）
+orderTotalPrice = 1120
+tradeState      = -1
 ```
