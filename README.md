@@ -1,3 +1,20 @@
+> ## 📌 关于本仓库
+>
+> 本仓库 fork 自 [Mikaelemmmm/go-zero-looklook](https://github.com/Mikaelemmmm/go-zero-looklook)（MIT License）。
+>
+> 我在研读其源码的基础上，对其做**缺陷修复、分布式一致性加固、安全加固与可观测性改造**。
+> 详细的改动清单、根因分析与验证证据见 **[REFACTOR.md](./REFACTOR.md)**。
+>
+> **改造进度：**
+> - [ ] 🐛 修复 gRPC 代码生成漂移导致字段静默丢失的缺陷
+> - [ ] 🔒 引入事务性发件箱（Outbox）解决支付链路的双写不一致
+> - [ ] 🛡 安全加固：bcrypt 密码、日志脱敏、JWT 缩短有效期 + jti 黑名单
+> - [ ] 📊 修复失效的日志过滤规则，为 ES 索引配置 Ingest Pipeline
+>
+> ---
+>
+> <以下是原项目 README>
+
 ## go-zero-looklook
 
 English | [简体中文](README-cn.md)
