@@ -10,6 +10,9 @@
 data/*
 !data/.gitkeep
 
+# local run configs (host-native debugging, see etc/*.local.yaml)
+**/*.local.yaml
+
 # gitlab ci
 .cache
 
