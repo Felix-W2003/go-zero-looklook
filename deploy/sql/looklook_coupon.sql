@@ -81,6 +81,10 @@ CREATE TABLE `user_coupon` (
 
 -- ----------------------------
 -- 优惠券操作流水（审计）
+-- ⚠️ action 的取值必须与 app/coupon/model/status.go 的常量保持一致：
+--      1 = 领取(CouponActionClaim)   2 = 锁定(CouponActionLock)
+--      3 = 核销(CouponActionUse)     4 = 释放(CouponActionRelease)
+--      5 = 过期(CouponActionExpire)
 -- ----------------------------
 DROP TABLE IF EXISTS `coupon_use_record`;
 CREATE TABLE `coupon_use_record` (
@@ -88,7 +92,7 @@ CREATE TABLE `coupon_use_record` (
   `coupon_code` varchar(32)  NOT NULL DEFAULT '' COMMENT '券码',
   `user_id`     bigint       NOT NULL DEFAULT '0' COMMENT '用户id',
   `order_sn`    varchar(32)  NOT NULL DEFAULT '' COMMENT '订单号',
-  `action`      tinyint      NOT NULL DEFAULT '0' COMMENT '1锁定 2核销 3释放 4过期',
+  `action`      tinyint      NOT NULL DEFAULT '0' COMMENT '1领取 2锁定 3核销 4释放 5过期',
   `remark`      varchar(255) NOT NULL DEFAULT '' COMMENT '备注',
   `create_time` datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
