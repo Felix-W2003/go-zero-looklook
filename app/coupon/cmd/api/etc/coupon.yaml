@@ -1,0 +1,33 @@
+Name: coupon-api
+Host: 0.0.0.0
+Port: 1005
+Mode: dev
+
+
+#监控
+Prometheus:
+  Host: 0.0.0.0
+  Port: 4012
+  Path: /metrics
+
+#链路追踪
+Telemetry:
+  Name: coupon-api
+  Endpoint: http://jaeger:14268/api/traces
+  Sampler: 1.0
+  Batcher: jaeger
+
+Log:
+  ServiceName: coupon-api
+  Level: error
+
+#jwt（所有 api 与 rpc 必须使用同一个 AccessSecret）
+JwtAuth:
+  AccessSecret: ae0536f9-6450-4606-8e13-5a19ed505da0
+  AccessExpire: 31536000
+
+#rpc
+CouponRpcConf:
+  Endpoints:
+    - 127.0.0.1:2005
+  NonBlock: true

@@ -13,8 +13,5 @@ type Config struct {
 	}
 	Cache cache.CacheConf
 
-	TravelRpcConf zrpc.RpcClientConf
-
-	//优惠券服务（下单锁券 / 取消释放券）
-	CouponRpcConf zrpc.RpcClientConf
+	UsercenterRpcConf zrpc.RpcClientConf
 }

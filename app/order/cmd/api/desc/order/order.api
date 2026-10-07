@@ -14,6 +14,7 @@ type (
 		LiveEndTime   int64  `json:"liveEndTime"`
 		LivePeopleNum int64  `json:"livePeopleNum"`
 		Remark        string `json:"remark"`
+		CouponCode    string `json:"couponCode,optional"` //可选：使用的优惠券码
 	}
 	CreateHomestayOrderResp {
 		OrderSn string `json:"orderSn"`
