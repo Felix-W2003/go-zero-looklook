@@ -2,14 +2,15 @@ package logic
 
 import (
 	"context"
-	"github.com/pkg/errors"
-	"github.com/zeromicro/go-zero/core/logx"
-	"github.com/zeromicro/go-zero/core/stores/sqlx"
 	"looklook/app/usercenter/cmd/rpc/internal/svc"
 	"looklook/app/usercenter/cmd/rpc/usercenter"
 	"looklook/app/usercenter/model"
 	"looklook/pkg/tool"
 	"looklook/pkg/xerr"
+
+	"github.com/pkg/errors"
+	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/stores/sqlx"
 )
 
 var ErrUserAlreadyRegisterError = xerr.NewErrMsg("user has been registered")
@@ -46,7 +47,11 @@ func (l *RegisterLogic) Register(in *usercenter.RegisterReq) (*usercenter.Regist
 			user.Nickname = tool.Krand(8, tool.KC_RAND_KIND_ALL)
 		}
 		if len(in.Password) > 0 {
-			user.Password = tool.Md5ByString(in.Password)
+			hashed, hashErr := tool.HashPassword(in.Password)
+			if hashErr != nil {
+				return errors.Wrapf(xerr.NewErrCode(xerr.SERVER_COMMON_ERROR), "bcrypt hash password err:%v", hashErr)
+			}
+			user.Password = hashed
 		}
 		insertResult, err := l.svcCtx.UserModel.Insert(ctx, session, user)
 		if err != nil {

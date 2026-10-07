@@ -70,7 +70,7 @@ func (l *LoginLogic) loginByMobile(mobile, password string) (int64, error) {
 		return 0, errors.Wrapf(ErrUserNoExistsError, "mobile:%s", mobile)
 	}
 
-	if !(tool.Md5ByString(password) == user.Password) {
+	if !l.verifyAndMigratePassword(user, password) {
 		return 0, errors.Wrap(ErrUsernamePwdError, "密码匹配出错")
 	}
 
@@ -79,4 +79,41 @@ func (l *LoginLogic) loginByMobile(mobile, password string) (int64, error) {
 
 func (l *LoginLogic) loginBySmallWx() error {
 	return nil
+}
+
+// verifyAndMigratePassword 校验密码，并对存量 MD5 哈希做渐进式迁移（Lazy Migration）。
+//
+// 迁移策略：
+//
+//   - 存储值已是 bcrypt：直接用 bcrypt 校验；
+//
+//   - 存储值还是 MD5：先用 MD5 校验，通过后立即用 bcrypt 重新加密并更新数据库，
+//     该用户下次登录即走 bcrypt 分支，实现无感迁移。
+//
+//     安全约束：本函数内不得记录 password 的明文或任何哈希值（详见 REFACTOR 第 2 项）。
+func (l *LoginLogic) verifyAndMigratePassword(user *model.User, password string) bool {
+	// 分支一：新数据，直接用 bcrypt 校验
+	if tool.IsBcryptHash(user.Password) {
+		return tool.CheckPassword(user.Password, password)
+	}
+
+	// 分支二：存量 MD5 数据
+	if tool.Md5ByString(password) != user.Password {
+		return false
+	}
+
+	// 密码校验已通过 → 就地升级为 bcrypt
+	hashed, err := tool.HashPassword(password)
+	if err != nil {
+		// 升级失败不影响本次登录（用户密码本身是正确的），只记日志，下次登录会重试
+		l.Errorf("migrate password to bcrypt failed, userId=%d, err=%v", user.Id, err)
+		return true
+	}
+
+	user.Password = hashed
+	if _, err := l.svcCtx.UserModel.Update(l.ctx, nil, user); err != nil {
+		// 更新失败同样不影响本次登录，下次登录会重试
+		l.Errorf("update bcrypt password failed, userId=%d, err=%v", user.Id, err)
+	}
+	return true
 }

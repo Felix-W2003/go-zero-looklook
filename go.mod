@@ -117,5 +117,5 @@ require (
 	github.com/wechatpay-apiv3/wechatpay-go v0.2.9
 	github.com/zeromicro/go-queue v1.1.8
 	github.com/zeromicro/go-zero v1.7.3
-	golang.org/x/crypto v0.28.0 // indirect
+	golang.org/x/crypto v0.28.0
 )
