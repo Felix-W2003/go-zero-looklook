@@ -46,6 +46,7 @@ message CreateHomestayOrderReq {
   int64  userId = 5;
   int64  livePeopleNum = 6;
   string remark = 7;
+  string couponCode = 8;
 }
 message CreateHomestayOrderResp {
   string sn = 1;

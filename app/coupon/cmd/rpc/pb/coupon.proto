@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+option go_package = "./pb";
+
+package pb;
+
+// ============ model ============
+
+// 券模板
+message CouponTemplate {
+  int64  id = 1;
+  string name = 2;
+  int64  type = 3;              //1:满减
+  int64  discountAmount = 4;    //优惠金额(分)
+  int64  minAmount = 5;         //使用门槛(分)
+  int64  totalCount = 6;        //发行总量
+  int64  issuedCount = 7;       //已发放数量
+  int64  perUserLimit = 8;      //每人限领
+  int64  validStart = 9;        //有效期起(时间戳)
+  int64  validEnd = 10;         //有效期止(时间戳)
+  int64  status = 11;           //1:上架 0:下架
+}
+
+// 用户券
+message UserCoupon {
+  int64  id = 1;
+  int64  userId = 2;
+  int64  templateId = 3;
+  string couponCode = 4;
+  int64  status = 5;            //0:未使用 1:已锁定 2:已核销 3:已过期
+  string orderSn = 6;           //占用的订单号
+  int64  lockTime = 7;
+  int64  useTime = 8;
+  int64  expireTime = 9;
+  int64  discountAmount = 10;   //优惠金额(分)，领取时的快照
+  int64  minAmount = 11;        //使用门槛(分)，领取时的快照
+  string name = 12;             //券名称(展示用，实时取自模板，不做快照)
+}
+
+// ============ req / resp ============
+
+// 可领券列表
+message TemplateListReq {
+  int64 lastId = 1;
+  int64 pageSize = 2;
+}
+message TemplateListResp {
+  repeated CouponTemplate list = 1;
+}
+
+// 领取券
+message ClaimCouponReq {
+  int64 userId = 1;
+  int64 templateId = 2;
+}
+message ClaimCouponResp {
+  string couponCode = 1;
+}
+
+// 我的券
+message ListUserCouponsReq {
+  int64 userId = 1;
+  int64 status = 2;             //-1:全部
+  int64 lastId = 3;
+  int64 pageSize = 4;
+}
+message ListUserCouponsResp {
+  repeated UserCoupon list = 1;
+}
+
+// 下单前预览可用券
+message PreviewCouponReq {
+  int64 userId = 1;
+  int64 amount = 2;             //订单原价(分)
+}
+message PreviewCouponItem {
+  string couponCode = 1;
+  int64  discountAmount = 2;    //可抵扣金额(分)
+  int64  finalAmount = 3;       //抵扣后金额(分)
+}
+message PreviewCouponResp {
+  repeated PreviewCouponItem list = 1;
+}
+
+// 下单锁定券（order-rpc 调用，必须幂等）
+message LockCouponReq {
+  int64  userId = 1;
+  string couponCode = 2;
+  string orderSn = 3;
+  int64  amount = 4;      // 订单原价(分)，用于在锁券时重新校验使用门槛
+}
+message LockCouponResp {
+  int64 discountAmount = 1;   //实际抵扣金额(分)
+  int64 finalAmount = 2;      //抵扣后应付金额(分)
+}
+
+// 支付成功后核销（order-mq 调用，必须幂等）
+message UseCouponReq {
+  string orderSn = 1;
+}
+message UseCouponResp {
+}
+
+// 订单取消/超时释放（order-rpc / 定时任务调用，必须幂等）
+message ReleaseCouponReq {
+  string orderSn = 1;
+}
+message ReleaseCouponResp {
+}
+
+// ============ service ============
+
+service coupon {
+  // 可领券列表
+  rpc templateList(TemplateListReq) returns(TemplateListResp);
+  // 领取券
+  rpc claimCoupon(ClaimCouponReq) returns(ClaimCouponResp);
+  // 我的券
+  rpc listUserCoupons(ListUserCouponsReq) returns(ListUserCouponsResp);
+  // 预览可用券
+  rpc previewCoupon(PreviewCouponReq) returns(PreviewCouponResp);
+
+  // 下单锁定券
+  rpc lockCoupon(LockCouponReq) returns(LockCouponResp);
+  // 支付成功后核销
+  rpc useCoupon(UseCouponReq) returns(UseCouponResp);
+  // 订单取消/超时释放
+  rpc releaseCoupon(ReleaseCouponReq) returns(ReleaseCouponResp);
+}

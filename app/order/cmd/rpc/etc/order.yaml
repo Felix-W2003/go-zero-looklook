@@ -36,3 +36,9 @@ TravelRpcConf:
     - 127.0.0.1:2003
   NonBlock: true
 
+#优惠券服务（下单锁券 / 取消释放券）
+CouponRpcConf:
+  Endpoints:
+    - 127.0.0.1:2005
+  NonBlock: true
+

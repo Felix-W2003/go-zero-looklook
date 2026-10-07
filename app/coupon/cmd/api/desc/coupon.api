@@ -1,0 +1,107 @@
+syntax = "v1"
+
+info (
+	title:   "优惠券服务"
+	desc:    "优惠券服务"
+	version: "v1"
+)
+
+//=====================================> coupon v1 <=================================
+type (
+	// 券模板（可领取的券）
+	TemplateInfo {
+		TemplateId     int64  `json:"templateId"`
+		Name           string `json:"name"`
+		DiscountAmount int64  `json:"discountAmount"` //优惠金额(分)
+		MinAmount      int64  `json:"minAmount"` //使用门槛(分)
+		ValidStart     int64  `json:"validStart"` //有效期起(时间戳)
+		ValidEnd       int64  `json:"validEnd"` //有效期止(时间戳)
+		RemainCount    int64  `json:"remainCount"` //剩余可领数量
+	}
+	// 用户持有的券
+	UserCoupon {
+		CouponCode     string `json:"couponCode"` //券码
+		Name           string `json:"name"` //券名称
+		DiscountAmount int64  `json:"discountAmount"` //优惠金额(分)
+		MinAmount      int64  `json:"minAmount"` //使用门槛(分)
+		Status         int64  `json:"status"` //0:未使用 1:已锁定 2:已核销 3:已过期
+		ExpireTime     int64  `json:"expireTime"` //过期时间(时间戳)
+	}
+)
+
+type (
+	TemplateListReq {
+		LastId   int64 `json:"lastId"`
+		PageSize int64 `json:"pageSize"`
+	}
+	TemplateListResp {
+		List []TemplateInfo `json:"list"`
+	}
+)
+
+type (
+	ClaimReq {
+		TemplateId int64 `json:"templateId"`
+	}
+	ClaimResp {
+		CouponCode string `json:"couponCode"`
+	}
+)
+
+type (
+	MyCouponsReq {
+		Status   int64 `json:"status"` //-1:全部 0:未使用 1:已锁定 2:已核销 3:已过期
+		LastId   int64 `json:"lastId"`
+		PageSize int64 `json:"pageSize"`
+	}
+	MyCouponsResp {
+		List []UserCoupon `json:"list"`
+	}
+)
+
+type (
+	PreviewCouponReq {
+		Amount int64 `json:"amount"` //订单原价(分)
+	}
+	// 可用券及其抵扣后的实付金额
+	PreviewCouponItem {
+		CouponCode     string `json:"couponCode"`
+		DiscountAmount int64  `json:"discountAmount"` //可抵扣金额(分)
+		FinalAmount    int64  `json:"finalAmount"` //抵扣后金额(分)
+	}
+	PreviewCouponResp {
+		List []PreviewCouponItem `json:"list"`
+	}
+)
+
+//no need login
+@server (
+	prefix: coupon/v1
+	group:  coupon
+)
+service coupon {
+	@doc "可领取的优惠券列表"
+	@handler templateList
+	post /coupon/templateList (TemplateListReq) returns (TemplateListResp)
+}
+
+//need login
+@server (
+	prefix: coupon/v1
+	group:  coupon
+	jwt:    JwtAuth
+)
+service coupon {
+	@doc "领取优惠券"
+	@handler claim
+	post /coupon/claim (ClaimReq) returns (ClaimResp)
+
+	@doc "我的优惠券"
+	@handler myCoupons
+	post /coupon/myCoupons (MyCouponsReq) returns (MyCouponsResp)
+
+	@doc "下单前预览可用券"
+	@handler previewCoupon
+	post /coupon/previewCoupon (PreviewCouponReq) returns (PreviewCouponResp)
+}
+

@@ -6,6 +6,7 @@ import (
 	"github.com/hibiken/asynq"
 	"looklook/app/mqueue/cmd/job/jobtype"
 
+	"looklook/app/coupon/cmd/rpc/coupon"
 	"looklook/app/order/cmd/rpc/internal/svc"
 	"looklook/app/order/cmd/rpc/pb"
 	"looklook/app/order/model"
@@ -56,8 +57,27 @@ func (l *UpdateHomestayOrderTradeStateLogic) UpdateHomestayOrderTradeState(in *p
 		return nil, errors.Wrapf(xerr.NewErrMsg("Failed to update homestay order status"), "Failed to update homestay order status db UpdateWithVersion err:%v , in : %v", err, in)
 	}
 
-	//4、notify user
-	if in.TradeState == model.HomestayOrderTradeStateWaitUse {
+	//4、优惠券联动 + 通知用户
+	//
+	// ⭐ 这里是**所有订单状态变更的唯一入口**：
+	//    · 支付成功（order-mq 消费 Kafka 后调用）→ 核销券
+	//    · 用户主动取消 / 30 分钟超时关单（asynq 延迟任务）→ 释放券
+	//    所以券的核销与释放只需要在这一个地方处理。
+	//
+	// ⚠️ 已知的权衡（记录在设计文档的「已知风险」里）：
+	//    订单状态已经更新完了，此时再调 coupon-rpc 属于**又一次跨服务双写**。
+	//    若这里失败，只记日志（不回滚订单状态）—— 否则会把订单状态回滚成"待支付"，
+	//    反而引入更严重的不一致。
+	//    影响面：券会停留在"已锁定"，30 分钟后被自动释放（用户白用了优惠）。
+	//    彻底解决需要把 order 侧也接入事务性发件箱（Outbox），属于二期工作。
+	switch in.TradeState {
+	case model.HomestayOrderTradeStateWaitUse:
+		// 支付成功 → 核销券（UseCoupon 幂等：Kafka 消息重投不会重复核销）
+		if _, e := l.svcCtx.CouponRpc.UseCoupon(l.ctx, &coupon.UseCouponReq{OrderSn: homestayOrder.Sn}); e != nil {
+			logx.WithContext(l.ctx).Errorf("use coupon fail , sn:%s , err:%v", homestayOrder.Sn, e)
+		}
+
+		// 通知用户（原有逻辑）
 		payload, err := json.Marshal(jobtype.PaySuccessNotifyUserPayload{Order: homestayOrder})
 		if err != nil {
 			logx.WithContext(l.ctx).Errorf("pay success notify user task json Marshal fail, err :%+v , sn : %s", err, homestayOrder.Sn)
@@ -66,6 +86,15 @@ func (l *UpdateHomestayOrderTradeStateLogic) UpdateHomestayOrderTradeState(in *p
 			if err != nil {
 				logx.WithContext(l.ctx).Errorf("pay success notify user  insert queue fail err :%+v , sn : %s", err, homestayOrder.Sn)
 			}
+		}
+
+	case model.HomestayOrderTradeStateCancel:
+		// 订单取消 / 超时关单 → 释放券（ReleaseCoupon 幂等）
+		//
+		// ⚠️ 券服务内部会校验"只有已锁定的券才能释放"，
+		//    所以即使订单本来就没用券，这里也是安全的（会走幂等分支返回成功）。
+		if _, e := l.svcCtx.CouponRpc.ReleaseCoupon(l.ctx, &coupon.ReleaseCouponReq{OrderSn: homestayOrder.Sn}); e != nil {
+			logx.WithContext(l.ctx).Errorf("release coupon fail , sn:%s , err:%v", homestayOrder.Sn, e)
 		}
 	}
 

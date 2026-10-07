@@ -2,6 +2,7 @@ package svc
 
 import (
 	"github.com/hibiken/asynq"
+	"looklook/app/coupon/cmd/rpc/coupon"
 	"looklook/app/order/cmd/rpc/internal/config"
 	"looklook/app/order/model"
 	"looklook/app/travel/cmd/rpc/travel"
@@ -15,6 +16,7 @@ type ServiceContext struct {
 	AsynqClient *asynq.Client
 
 	TravelRpc travel.Travel
+	CouponRpc coupon.Coupon
 
 	HomestayOrderModel model.HomestayOrderModel
 }
@@ -25,6 +27,7 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		AsynqClient:newAsynqClient(c),
 
 		TravelRpc: travel.NewTravel(zrpc.MustNewClient(c.TravelRpcConf)),
+		CouponRpc: coupon.NewCoupon(zrpc.MustNewClient(c.CouponRpcConf)),
 
 		HomestayOrderModel: model.NewHomestayOrderModel(sqlx.NewMysql(c.DB.DataSource), c.Cache),
 	}
