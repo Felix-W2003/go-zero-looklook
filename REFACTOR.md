@@ -14,7 +14,7 @@
 | 3 | 安全加固 · 密码存储改用 bcrypt | ✅ 已完成 | `58d7fe3` |
 | 4 | 安全加固 · JWT 缩短有效期 + jti 黑名单 | 📋 计划中 | — |
 | 5 | 修复错误日志格式符未替换（`logx.Error` 误用为 `logx.Errorf`） | 📋 计划中 | — |
-| 6 | 引入事务性发件箱（Outbox）解决支付链路双写不一致 | 📋 计划中 | — |
+| 6 | 引入事务性发件箱（Outbox）解决支付链路双写不一致 | ✅ 已完成 | `a9b1e4b` |
 | 7 | 可观测性：修复失效的日志过滤规则、为 ES 配置 Ingest Pipeline | 📋 计划中 | — |
 
 > **每完成一项，我会补上完整的「问题现象 / 定位过程 / 根因 / 修复 / 验证证据」，并附对应 commit。**
@@ -553,6 +553,284 @@ POST /looklook-*/_search  {"query":{"match_phrase":{"data.log":"SAMEPWD-CHECK"}}
 
 ---
 
+## 6. 引入事务性发件箱（Outbox）解决支付链路双写不一致
+
+> 状态：✅ **已完成** —— 通过端到端投递 / 消费端幂等 / 退避重试 / 事务原子性 / Kafka 宕机不丢 五层验证
+
+### 问题现象
+
+[app/payment/cmd/rpc/internal/logic/updateTradeStateLogic.go](app/payment/cmd/rpc/internal/logic/updateTradeStateLogic.go)
+对两个独立系统做了两次写入：
+
+```go
+// ③ 写 MySQL
+if err := l.svcCtx.ThirdPaymentModel.UpdateWithVersion(l.ctx, nil, thirdPayment); err != nil {
+	return nil, ...
+}
+
+// ④ 发 Kafka
+if err := l.pubKqPaySuccess(in.Sn, in.PayStatus); err != nil {
+	logx.WithContext(l.ctx).Errorf("l.pubKqPaySuccess : %+v", err)   // ← 只记日志
+}
+```
+
+两者之间没有任何原子性保证：
+
+```
+③ 成功、④ 失败  →  支付流水已更新，但订单服务收不到通知
+                    ★ 用户付了钱，订单仍是「待支付」
+③ 失败          →  不会走到 ④，一致 ✓
+```
+
+更糟的是：④ 的失败**只记录日志、接口照常返回成功**，没有任何人知道出了问题。
+
+### 更深的问题：`kq.Pusher` 的错误处理几乎是装饰性的
+
+读 go-queue v1.1.8 源码（`kq/pusher.go`）发现三处问题：
+
+```go
+func (p *Pusher) Push(v string) error {
+	msg := kafka.Message{
+		Key:   []byte(strconv.FormatInt(time.Now().UnixNano(), 10)),  // ③ 时间戳当 key
+		Value: []byte(v),
+	}
+	if p.executor != nil {
+		return p.executor.Add(msg, len(v))     // ① 只是放进缓冲区
+	}
+	...
+}
+
+// ② 真实发送错误在这里被吞掉，调用方完全不知道
+pusher.executor = executors.NewChunkExecutor(func(tasks []interface{}) {
+	if err := pusher.produer.WriteMessages(context.Background(), chunk...); err != nil {
+		logx.Error(err)
+	}
+})
+```
+
+| # | 问题 | 后果 |
+|---|---|---|
+| ① | `Push` 是**缓冲的**，返回 nil ≠ 消息已发出 | 业务里的 `if err != nil` **几乎永不触发** |
+| ② | 真实发送错误被 `logx.Error` 吞掉 | 业务完全不知道消息丢了 |
+| ③ | Kafka key 用**纳秒时间戳** | 同一订单的消息散落到不同分区 → **乱序** |
+
+### 为什么不能"加个事务"
+
+MySQL 与 Kafka 是两个独立系统，**没有跨系统的本地事务**。
+2PC 不可行（Kafka 不支持 XA，且协调者单点）；Kafka 也没有 RocketMQ 的事务消息（半消息）机制。
+
+### 方案对比与选择
+
+| 方案 | 说明 | 是否采纳 |
+|---|---|---|
+| 尽力而为（原实现） | 先写库再发消息，失败只记日志 | ❌ 会丢消息 |
+| 2PC / XA | 分布式事务 | ❌ Kafka 不支持；性能差；协调者单点 |
+| 事务消息 | MQ 提供半消息机制 | ❌ Kafka 没有该能力（RocketMQ 才有） |
+| CDC（Debezium 读 binlog） | 从数据库变更日志捕获 | ❌ 需额外引入组件，本项目无此基础设施 |
+| **事务性发件箱（Outbox）** | 业务数据与待发消息在同一本地事务落地 | ✅ **采纳** |
+
+### 核心思想
+
+> **不要「写库 + 发消息」，而要「写库 + 写一条待发消息」** ——
+> 因为后者**两个都是数据库操作**，可以放进同一个本地事务。
+
+```
+┌────────── 同一个本地事务（原子） ──────────┐
+│  ① UPDATE third_payment ...               │
+│  ② INSERT INTO outbox (topic,key,payload) │
+└───────────────────────────────────────────┘
+         ↓ 提交：要么都成功，要么都回滚
+   （此刻消息已安全落地，只是还没发出去）
+         ↓
+   ③ relay 扫描 outbox → 投递 Kafka → 标记已发送
+         ↓
+   ④ Kafka → order-mq 消费 → order-rpc 更新订单状态（幂等）
+```
+
+**三个保证：**
+
+| 保证 | 靠什么实现 |
+|---|---|
+| **不丢（原子性）** | 业务数据与 outbox 记录在同一本地事务 → 不存在「改了库但没记消息」 |
+| **不丢（持久性）** | Kafka / relay 挂掉时消息仍在表中 → relay 恢复后重投 |
+| **不重（幂等）** | relay 可能「投递成功但标记前崩溃」→ 重启后重投 → **消费端必须幂等** |
+
+### 表结构
+
+```sql
+CREATE TABLE `outbox` (
+  `id`            bigint        NOT NULL AUTO_INCREMENT,
+  `topic`         varchar(64)   NOT NULL DEFAULT '',
+  `msg_key`       varchar(64)   NOT NULL DEFAULT '',
+  `payload`       varchar(2048) NOT NULL DEFAULT '',
+  `status`        tinyint       NOT NULL DEFAULT 0 COMMENT '0待投递 1已投递 2已死信',
+  `retry_count`   int           NOT NULL DEFAULT 0,
+  `next_retry_at` datetime      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `last_error`    varchar(512)  NOT NULL DEFAULT '',
+  `created_at`    datetime      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `sent_at`       datetime      DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_status_next_retry` (`status`,`next_retry_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='事务性发件箱';
+```
+
+**设计说明：**
+
+| 字段 | 作用 |
+|---|---|
+| `msg_key` | 存业务唯一键（订单号），投递时作为 Kafka key → **同一订单的消息落同一分区 → 有序** |
+| `status` | `0 待投递` / `1 已投递` / `2 死信`（重试超限，需人工介入） |
+| `retry_count` + `next_retry_at` | **指数退避**，避免失败时疯狂重试拖垮下游 |
+| `last_error` | 记录失败原因，便于排查 |
+| `idx_status_next_retry` | 正好覆盖 relay 的核心查询 `WHERE status=0 AND next_retry_at<=now()` |
+
+### 实现
+
+**① 业务改造：两个写入放进同一个事务**
+
+```go
+err = l.svcCtx.OutboxModel.Trans(l.ctx, func(ctx context.Context, session sqlx.Session) error {
+	// ① 更新业务数据（传入同一个 session）
+	if err := l.svcCtx.ThirdPaymentModel.UpdateWithVersion(ctx, session, thirdPayment); err != nil {
+		return errors.Wrapf(xerr.NewErrCode(xerr.DB_ERROR), "...", err)
+	}
+
+	// ② 写待发消息（与①同事务 → 原子）
+	body, err := json.Marshal(kqueue.ThirdPaymentUpdatePayStatusNotifyMessage{
+		OrderSn:   in.Sn,
+		PayStatus: in.PayStatus,
+	})
+	if err != nil {
+		return errors.Wrapf(xerr.NewErrMsg("outbox payload marshal error"), "...", err)
+	}
+
+	if _, err = l.svcCtx.OutboxModel.Insert(ctx, session, &model.Outbox{
+		Topic:   l.svcCtx.Config.KqPaymentUpdatePayStatusConf.Topic,
+		MsgKey:  in.Sn, // ★ 用订单号作 Kafka key，保证同一订单有序
+		Payload: string(body),
+		Status:  model.OutboxStatusPending,
+	}); err != nil {
+		return errors.Wrapf(xerr.NewErrCode(xerr.DB_ERROR), "...", err)
+	}
+	return nil
+})
+if err != nil {
+	return nil, err
+}
+```
+
+**关键变化**：以前发消息失败只记日志，现在**任何一步失败都会回滚整个事务并返回错误**。
+同时删除了原有的 `pubKqPaySuccess` 直发路径（见踩坑记录第 7 条）。
+
+**② relay 服务**（[app/payment/cmd/relay/](app/payment/cmd/relay/)）
+
+刻意**不使用 `kq.Pusher`**，改用底层的 `github.com/segmentio/kafka-go`：
+
+```go
+writer := &kafka.Writer{
+	Addr:         kafka.TCP(c.Brokers...),
+	Topic:        c.Topic,
+	Balancer:     &kafka.Hash{},        // 按 key 分区 → 同一订单消息有序
+	RequiredAcks: kafka.RequireAll,     // 等所有 ISR 确认才算成功
+	Async:        false,                // 同步发送，才能拿到真实错误
+}
+```
+
+**③ 并发安全：`FOR UPDATE SKIP LOCKED`**
+
+```sql
+select ... from outbox
+where status = 0 and next_retry_at <= ?
+order by id asc limit ?
+for update skip locked
+```
+
+- `FOR UPDATE` 锁住取到的行
+- `SKIP LOCKED` **跳过已被其他事务锁住的行** → 多个 relay 实例各取各的，
+  **既不重复投递、也不互相阻塞**（MySQL 8.0+ 特性）
+
+### 验证
+
+**① 端到端投递**
+
+```
+11:31:25  订单创建           trade_state = 0
+11:31:30  插入 outbox        status=0，未被投递
+11:31:32  relay 投递成功     status=1，sent_at=11:31:32
+11:31:32  订单状态变更        trade_state 0 → 1
+```
+
+链路：`outbox(status=0)` → relay（每 500ms 扫描）→ Kafka（key=订单号，acks=all）→
+order-mq 消费 → order-rpc 状态机 → 订单变为「待使用」。**延迟 2 秒。**
+
+**② 消费端幂等**（模拟「投递成功但标记 sent 前崩溃」）
+
+```
+原 update_time = 11:31:32
+把 outbox 记录改回 status=0 → relay 重投（sent_at=11:31:46，确实重投了）
+重投后 update_time = 11:31:32   ★ 完全没变
+```
+
+`update_time` 未变，说明第二次消息**没有触发数据库 UPDATE** ——
+[updateHomestayOrderTradeStateLogic.go](app/order/cmd/rpc/internal/logic/updateHomestayOrderTradeStateLogic.go)
+中「状态相同则提前返回」的幂等逻辑生效。
+
+**③ 退避门控 + 恢复投递**
+
+```
+11:32:10  插入记录（next_retry_at = 11:32:25，retry_count=3，模拟已失败 3 次）
+11:32:14  检查 → status 仍为 0（被退避门控挡住，未投递）订单仍为 0
+11:32:26  到期后自动投递 → status=1  订单 0 → 1
+```
+
+**证明退避门控生效，且到期后无需人工干预即可自动恢复投递。**
+
+**④ 事务原子性**（故障注入）
+
+在一个事务内：先用真实的 `UpdateWithVersion(ctx, session, ...)` 更新业务数据，
+再故意插入一条 `msg_key` 超长（100 字符 > `varchar(64)`）的 outbox 记录使其失败：
+
+```
+1. SELECT third_payment       → trade_state="ORIGINAL_STATE", version=0
+2. UPDATE third_payment SET trade_state='SHOULD_NOT_PERSIST' WHERE id=42 AND version=0
+3. INSERT INTO outbox (msg_key=100个X)
+   → Error 1406 (22001): Data too long for column 'msg_key'
+4. 事务回滚
+5. 重新 SELECT                → trade_state="ORIGINAL_STATE", version=0   ★ 完全没变
+```
+
+**证明两个写入确实同生共死**：outbox 插入失败 → 业务数据的更新被回滚。
+
+**⑤ Kafka 宕机不丢消息**
+
+```
+① docker stop kafka
+② 插入一条待投递消息
+③ 观察：status 保持 0，retry_count 递增，last_error 记录连接错误；订单仍为「待支付」
+④ docker start kafka
+⑤ 观察：消息最终被投出，status=1，订单 0 → 1
+```
+
+**这是 Outbox 最核心的承诺：Kafka 不可用期间消息不丢，恢复后自动补投。**
+
+### 关键设计点
+
+1. **消息只保留一条路径**：改造后业务代码只写 outbox，不再直发 Kafka。
+   若同时保留两条路径会产生重复消息（比丢失更难排查）。
+2. **消费端幂等是设计的一部分**，不是可选项 —— Outbox 天然是 at-least-once 语义。
+   本项目消费端的状态机已天然满足（状态相同则提前返回）。
+3. **死信机制**：重试超限（默认 10 次）转 `status=2`，不再无限重试拖累队列，需告警/人工介入。
+4. **定期清理**：relay 每小时删除 7 天前已投递成功的记录，避免表无限膨胀。
+5. **⚠️ 已知权衡**：relay 在事务内做网络 I/O，会持有行锁。
+   低并发下可接受；生产级优化是**先在短事务内把记录标记为「发送中」并记录认领时间，
+   再在事务外投递**，配合超时回收机制。
+
+### commit
+
+`a9b1e4b` — feat(payment): introduce transactional outbox for pay-status notification
+
+---
+
 ## 附：踩坑记录
 
 改造过程中遇到的、值得记录的问题。
@@ -638,3 +916,19 @@ if ($raw.Contains($old)) { ...; Write-Host 'OK' } else { Write-Host '未找到�
 
 **教训**：**替换操作必须能确认「到底替换成功了没有」** —— 静默失败比报错更危险，
 因为你会基于错误的前提继续往下走。（与第 1 条同源：**操作没成功，却没有任何信号**。）
+
+### 7. 只加新路径、不删旧路径 = 重复消息的温床
+
+引入 Outbox 后，业务代码改为「只写 outbox，由 relay 投递」。
+但原有的 `pubKqPaySuccess`（直接 `kq.Pusher.Push`）如果只是**不再调用**、**却不删除**，
+就会在主干上留下一条"看起来还能用"的旧路径。
+
+**风险**：后续维护者看到它，可能误以为"发消息要调这个"，从而恢复直发 ——
+于是同一条业务事件被投递两次（一条来自直发、一条来自 relay），产生**重复消息**。
+而重复消息通常**比丢失消息更难排查**：业务状态会被改错，却不一定报错。
+
+**对策**：替换投递路径时，**把旧路径彻底删掉**，而不是留着不调用。
+若担心回滚，依赖版本控制即可（需要时从历史提交恢复），而不是把死代码留在主干上。
+
+**这类问题的通用形式**：**"两条都通向目的地的路"比"断路"更危险** ——
+断路会报错，双路会静默产生重复。

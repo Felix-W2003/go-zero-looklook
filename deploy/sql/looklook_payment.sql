@@ -45,3 +45,24 @@ CREATE TABLE `third_payment` (
 ) ENGINE=InnoDB AUTO_INCREMENT=42 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='第三方支付流水记录';
 
 SET FOREIGN_KEY_CHECKS = 1;
+
+-- ----------------------------
+-- 事务性发件箱（Transactional Outbox）
+-- 用途：解决「更新本地库」与「发送 Kafka 消息」的双写不一致。
+--       业务数据与待发消息在同一本地事务中落地，由 relay 进程异步投递。
+-- ----------------------------
+DROP TABLE IF EXISTS `outbox`;
+CREATE TABLE `outbox` (
+  `id`            bigint        NOT NULL AUTO_INCREMENT,
+  `topic`         varchar(64)   NOT NULL DEFAULT '' COMMENT '目标 Kafka topic',
+  `msg_key`       varchar(64)   NOT NULL DEFAULT '' COMMENT '消息 key，用业务唯一键保证同实体有序',
+  `payload`       varchar(2048) NOT NULL DEFAULT '' COMMENT '消息体 JSON',
+  `status`        tinyint       NOT NULL DEFAULT '0' COMMENT '0待投递 1已投递 2已死信',
+  `retry_count`   int           NOT NULL DEFAULT '0' COMMENT '已重试次数',
+  `next_retry_at` datetime      NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '下次可投递时间',
+  `last_error`    varchar(512)  NOT NULL DEFAULT '' COMMENT '最近一次失败原因',
+  `created_at`    datetime      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `sent_at`       datetime      DEFAULT NULL COMMENT '投递成功时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_status_next_retry` (`status`,`next_retry_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='事务性发件箱';
