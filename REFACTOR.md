@@ -10,9 +10,12 @@
 | # | 改造项 | 状态 | 对应 commit |
 |---|---|---|---|
 | 1 | 修复 gRPC 代码生成漂移导致字段静默丢失 | ✅ 已完成 | `77a4a1e` |
-| 2 | 引入事务性发件箱（Outbox）解决支付链路双写不一致 | 📋 计划中 | — |
-| 3 | 安全加固：bcrypt 密码 / 日志脱敏 / JWT 缩短有效期 + jti 黑名单 | 📋 计划中 | — |
-| 4 | 可观测性：修复失效的日志过滤规则、为 ES 配置 Ingest Pipeline | 📋 计划中 | — |
+| 2 | 安全加固 · 日志脱敏：移除日志中的明文密码 | ✅ 已完成 | `506ecc8` |
+| 3 | 安全加固 · 密码存储改用 bcrypt | 📋 计划中 | — |
+| 4 | 安全加固 · JWT 缩短有效期 + jti 黑名单 | 📋 计划中 | — |
+| 5 | 修复错误日志格式符未替换（`logx.Error` 误用为 `logx.Errorf`） | 📋 计划中 | — |
+| 6 | 引入事务性发件箱（Outbox）解决支付链路双写不一致 | 📋 计划中 | — |
+| 7 | 可观测性：修复失效的日志过滤规则、为 ES 配置 Ingest Pipeline | 📋 计划中 | — |
 
 > **每完成一项，我会补上完整的「问题现象 / 定位过程 / 根因 / 修复 / 验证证据」，并附对应 commit。**
 > 未完成的项只保留问题描述，不写未经验证的结论。
@@ -201,3 +204,162 @@ HTTP 200
 ### commit
 
 `77a4a1e` — fix(order): regenerate gRPC code to fix silently dropped needFood field
+
+---
+
+## 2. 安全加固 · 日志脱敏：移除日志中的明文密码
+
+> 状态：✅ **已完成** —— 已通过 ES 日志前后对比验证
+
+### 问题现象
+
+用户**登录失败**时，输入的**明文密码会被写入应用日志**。从日志平台（ES）检索到的原始记录：
+
+```json
+{
+  "@timestamp": "2026-10-07T08:35:12.699+08:00",
+  "caller": "clientinterceptors/durationinterceptor.go:35",
+  "content": "fail - direct:/127.0.0.1:2004/pb.usercenter/login - authType:\"system\"  authKey:\"18116427072\"  password:\"620WFwf0aaa\" - rpc error: code = Code(100001) desc = 账号或密码不正确",
+  "level": "error"
+}
+```
+
+其中 `password:"620WFwf0aaa"` 即用户输入的明文密码。
+
+**危害**：日志会被长期留存并采集到 ES。若有人对系统做密码爆破，**所有尝试过的密码都会被完整记录下来**；
+日志平台权限管控不严时，等于泄露一份「用户真实用过的密码候选表」。这也是等保 / PCI-DSS 明确要求的
+——**认证凭据不得落盘**。
+
+### 泄漏来源（共两处，必须同时修复）
+
+**来源 A：项目代码用 `%+v` 打印了整个请求体**
+
+[app/usercenter/cmd/api/internal/logic/user/registerLogic.go](app/usercenter/cmd/api/internal/logic/user/registerLogic.go)：
+
+```go
+if err != nil {
+    return nil, errors.Wrapf(err, "req: %+v", req)   // req 含 Password 字段
+}
+```
+
+`%+v` 输出 `{Mobile:... Password:...}`，该错误消息最终由 `result.HttpResult` 以 `%+v` 写入日志。
+
+> 已扫描全项目 10 处「用 `%+v` 打印请求体」的代码，**只有这一处含密码**；
+> rpc 侧业务逻辑只用 `mobile:%s` / `id:%d` 这类单字段，无泄漏。
+
+**来源 B：go-zero 客户端拦截器会自动打印整个请求结构体**
+
+`zrpc` 默认挂载的 `DurationInterceptor` 在 **RPC 失败**或**触发慢调用阈值**时会把 `req` 整个写进日志：
+
+```go
+_, ok := notLoggingContentMethods.Load(method)
+if ok {
+    logger.Errorf("fail - %s - %s", serverName, err.Error())            // 不打印请求体
+} else {
+    logger.Errorf("fail - %s - %v - %s", serverName, req, err.Error())   // ★ 打印整个 req
+}
+```
+
+因此 `LoginReq{password}` / `RegisterReq{password}` 被完整记录。
+
+### 修复方案
+
+**修复 A：只记录定位问题所需的非敏感字段**
+
+```go
+if err != nil {
+    // 不要把整个 req 打进错误：它包含明文密码，会被写入日志。
+    // 只记录定位问题所需的非敏感字段。
+    return nil, errors.Wrapf(err, "mobile: %s", req.Mobile)
+}
+```
+
+**修复 B：把敏感 RPC 方法加入「不记录请求体」名单**
+
+go-zero 已内置该开关（`zrpc.DontLogClientContentForMethod`），
+但**必须在发起调用的进程（usercenter-api）中注册，而不是 rpc 服务端**：
+
+[app/usercenter/cmd/api/internal/svc/serviceContext.go](app/usercenter/cmd/api/internal/svc/serviceContext.go)
+
+```go
+func NewServiceContext(c config.Config) *ServiceContext {
+	// 关闭 go-zero 客户端拦截器对敏感方法请求体的日志输出。
+	// 方法名格式为 /{proto包名}.{服务名}/{方法名}；
+	// 本项目 proto 中服务名与方法名均为小写（见 app/usercenter/cmd/rpc/pb/usercenter.proto）。
+	zrpc.DontLogClientContentForMethod("/pb.usercenter/login")
+	zrpc.DontLogClientContentForMethod("/pb.usercenter/register")
+
+	return &ServiceContext{ ... }
+}
+```
+
+> **两个易错点（本次都遇到并确认）**：
+>
+> 1. **方法名必须与 `.proto` 逐字一致。** 本项目 proto 中写的是小写
+>    （`package pb; service usercenter { rpc login(...) }`），所以是 `/pb.usercenter/login`，
+>    **不是** `/pb.Usercenter/Login`。go-zero 官方单元测试的格式参考：
+>    `DontLogContentForMethod("/foo")`（**带前导斜杠**）。
+> 2. **必须放在 api 进程。** 泄漏发生在「客户端拦截器」，即 rpc 的**调用方**（usercenter-api）。
+>    若放到 rpc 的 serviceContext 里不会生效。
+
+### 验证
+
+**方法**：通过 nginx 网关发起「密码错误」的登录请求，再从 ES 日志平台检索前后变化。
+
+**改前**（08:30 ~ 08:35，共 4 条）：
+
+```json
+{"caller":"clientinterceptors/durationinterceptor.go:35",
+ "content":"fail - direct:/127.0.0.1:2004/pb.usercenter/login - authType:\"system\"  authKey:\"18116427072\"  password:\"620WFwf0aaa\" - rpc error: code = Code(100001) desc = 账号或密码不正确"}
+```
+
+**改后**（08:39 起）：
+
+```json
+{"caller":"clientinterceptors/durationinterceptor.go:33",
+ "content":"fail - direct:/127.0.0.1:2004/pb.usercenter/login - rpc error: code = Code(100001) desc = 账号或密码不正确"}
+```
+
+**两处结构性差异（这才是强证据）：**
+
+| | 改前 | 改后 |
+|---|---|---|
+| `caller` 行号 | `durationinterceptor.go:35` | `durationinterceptor.go:`**`33`** |
+| 日志内容 | 含 `authType` / `authKey` / `password` | **请求体整段消失** |
+
+> **为什么行号变化是强证据？** 因为程序走了另一条分支：
+> `:35` 是「打印请求体」的分支，`:33` 是「不打印请求体」的分支。
+> **行号变化证明是代码路径变了，而不是"日志恰好没刷出来"。**
+
+**功能未受影响**：
+- 正确密码登录仍正常返回 `{"code":200,"msg":"OK","data":{"accessToken":"..."}}`
+- 错误码与错误消息保持不变（`100001` / `账号或密码不正确`）
+
+### 排查过程中的一个坑（值得记录）
+
+第一次验证时密码**仍然出现**在日志中。原因不是修复方案有问题，而是
+**modd 没有重新编译成功（编译失败是静默的）**，容器里运行的仍是旧二进制。
+
+排查方法：
+
+```powershell
+# 1) 确认容器内看到的文件是不是最新的
+docker exec looklook cat /go/looklook/app/usercenter/cmd/api/internal/svc/serviceContext.go
+
+# 2) 确认二进制编译时间
+docker exec looklook ls -l --time-style=full-iso /go/looklook/data/server/usercenter-api
+
+# 3) 查看是否有编译错误
+docker logs looklook --tail 80 2>&1 | Select-String 'cannot|undefined|error|failed'
+
+# 4) 强制重新编译
+docker restart looklook
+```
+
+**教训**：**改了代码 ≠ 运行的是新代码。** 遇到「修了但没生效」，应先确认
+「当前运行的产物是哪一次构建的」，而不是怀疑修复方案本身。
+这与 CI/CD 中「构建失败但仍在跑旧版本」是同一类问题。
+
+### commit
+
+`506ecc8` — fix(usercenter): stop writing plaintext passwords to logs
