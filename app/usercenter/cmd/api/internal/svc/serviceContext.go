@@ -17,6 +17,9 @@ type ServiceContext struct {
 
 func NewServiceContext(c config.Config) *ServiceContext {
 
+	zrpc.DontLogClientContentForMethod("/pb.usercenter/login")
+	zrpc.DontLogClientContentForMethod("/pb.usercenter/register")
+
 	return &ServiceContext{
 		Config:        c,
 		UsercenterRpc: usercenter.NewUsercenter(zrpc.MustNewClient(c.UsercenterRpcConf)),

@@ -35,7 +35,9 @@ func (l *RegisterLogic) Register(req types.RegisterReq) (*types.RegisterResp, er
 		AuthType: model.UserAuthTypeSystem,
 	})
 	if err != nil {
-		return nil, errors.Wrapf(err, "req: %+v", req)
+		// 不要把整个req打进错误:它包含明文密码，会被写入日志
+		// 只记录定位问题所需的非敏感字段
+		return nil, errors.Wrapf(err, "mobile: %s", req.Mobile)
 	}
 
 	var resp types.RegisterResp
