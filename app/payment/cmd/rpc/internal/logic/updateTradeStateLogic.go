@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/stores/sqlx"
 )
 
 type UpdateTradeStateLogic struct {
@@ -58,36 +59,43 @@ func (l *UpdateTradeStateLogic) UpdateTradeState(in *pb.UpdateTradeStateReq) (*p
 		return nil, errors.Wrapf(xerr.NewErrMsg("This status is not currently supported"), "Modify payment flow status is not supported  in : %+v", in)
 	}
 
-	//3、update .
+	//3、更新支付流水 + 写入发件箱，二者在同一本地事务内完成
 	thirdPayment.TradeState = in.TradeState
 	thirdPayment.TransactionId = in.TransactionId
 	thirdPayment.TradeType = in.TradeType
 	thirdPayment.TradeStateDesc = in.TradeStateDesc
 	thirdPayment.PayStatus = in.PayStatus
 	thirdPayment.PayTime = time.Unix(in.PayTime, 0)
-	if err := l.svcCtx.ThirdPaymentModel.UpdateWithVersion(l.ctx, nil, thirdPayment); err != nil {
-		return nil, errors.Wrapf(xerr.NewErrCode(xerr.DB_ERROR), " UpdateTradeState UpdateWithVersion db  err:%v ,thirdPayment : %+v , in : %+v", err, thirdPayment, in)
-	}
 
-	//4、notify  sub "payment-update-paystatus-topic"  services(order-mq ..), pub、sub use kq
-	if err := l.pubKqPaySuccess(in.Sn, in.PayStatus); err != nil {
-		logx.WithContext(l.ctx).Errorf("l.pubKqPaySuccess : %+v", err)
+	err = l.svcCtx.OutboxModel.Trans(l.ctx, func(ctx context.Context, session sqlx.Session) error {
+		// ① 更新业务数据
+		if err := l.svcCtx.ThirdPaymentModel.UpdateWithVersion(ctx, session, thirdPayment); err != nil {
+			return errors.Wrapf(xerr.NewErrCode(xerr.DB_ERROR), "UpdateTradeState UpdateWithVersion db err:%v ,thirdPayment : %+v , in : %+v", err, thirdPayment, in)
+		}
+
+		// ② 写待发消息（与①同事务 → 原子）
+		body, err := json.Marshal(kqueue.ThirdPaymentUpdatePayStatusNotifyMessage{
+			OrderSn:   in.Sn,
+			PayStatus: in.PayStatus,
+		})
+		if err != nil {
+			return errors.Wrapf(xerr.NewErrMsg("outbox payload marshal error"), "marshal err:%v , sn:%s , payStatus:%d", err, in.Sn, in.PayStatus)
+		}
+
+		if _, err = l.svcCtx.OutboxModel.Insert(ctx, session, &model.Outbox{
+			Topic:   l.svcCtx.Config.KqPaymentUpdatePayStatusConf.Topic,
+			MsgKey:  in.Sn, // ★ 用订单号作 Kafka key → 同一订单的消息落在同一分区，保证有序
+			Payload: string(body),
+			Status:  model.OutboxStatusPending,
+		}); err != nil {
+			return errors.Wrapf(xerr.NewErrCode(xerr.DB_ERROR), "insert outbox err:%v , sn:%s", err, in.Sn)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return &pb.UpdateTradeStateResp{}, nil
-}
-
-func (l *UpdateTradeStateLogic) pubKqPaySuccess(orderSn string, payStatus int64) error {
-
-	m := kqueue.ThirdPaymentUpdatePayStatusNotifyMessage{
-		OrderSn:   orderSn,
-		PayStatus: payStatus,
-	}
-
-	body, err := json.Marshal(m)
-	if err != nil {
-		return errors.Wrapf(xerr.NewErrMsg("kq UpdateTradeStateLogic pushKqPaySuccess task marshal error "), "kq UpdateTradeStateLogic pushKqPaySuccess task marshal error  , v : %+v", m)
-	}
-
-	return l.svcCtx.KqueuePaymentUpdatePayStatusClient.Push(string(body))
 }
